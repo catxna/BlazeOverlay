@@ -4,6 +4,8 @@ Passive, information-only HUD and profit tracker for the Hypixel SkyBlock Infern
 
 The mod does not automate gameplay, attacks, movement, or item use. It reads boss/entity state and chat messages, then displays useful timing, attunement, drop, and profit information.
 
+> **Personal use:** This mod is specifically made for Catxna. During the boss fight, it uses username-based identification and only recognises the username `Catxna`.
+
 ## Features
 
 - Shows the current Blaze Slayer attunement and remaining hits near the crosshair.
