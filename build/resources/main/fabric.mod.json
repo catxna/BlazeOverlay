@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "blazeslayerhelper",
+  "version": "1.1.0",
+  "name": "Blaze Slayer Helper",
+  "description": "Passive Blaze Slayer overlay for Hypixel Skyblock (information only, no automation).",
+  "mixins": ["blazeslayerhelper.mixins.json"],
+  "authors": ["Catxna"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.blazeslayer.BlazeSlayerMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

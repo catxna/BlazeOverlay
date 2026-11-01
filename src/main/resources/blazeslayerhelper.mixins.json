@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "com.example.blazeslayer.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "HudMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
