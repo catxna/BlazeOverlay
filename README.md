@@ -8,7 +8,6 @@ The mod does not automate gameplay, attacks, movement, or item use. It reads bos
 
 - Shows the current Blaze Slayer attunement and remaining hits near the crosshair.
 - Shows the Twilight Arrow Poison indicator when detected.
-- Hides Hypixel's duplicate attunement swap title, subtitle, and action-bar text by default.
 - Displays kill time, spawn time, and a short result popup after each boss.
 - Tracks session boss counts, drops, average timings, profit, and profit per hour.
 - Tracks Re-heated Gummy Polar Bear duration and warns before it expires.
