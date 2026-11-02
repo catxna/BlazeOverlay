@@ -130,8 +130,8 @@ public class BlazeSlayerMod implements ClientModInitializer {
     private long resultUntil = 0;
     private long resultKillMs = 0;
     private long resultSpawnMs = -1;
-    private int resultKillColor = 0xFF55FF55;    // popup colours: green = faster than the session average, gold = average, red = slower
-    private int resultSpawnColor = 0xFFFFAA00;
+    private int resultKillColor = 0xFFFF9900;    // popup colours: green = faster than the session average, orange = about average, red = slower
+    private int resultSpawnColor = 0xFFFF9900;
     private final List<Long> killTimes = new ArrayList<>();    // every timed kill / spawn this session (for the gradient)
     private final List<Long> spawnTimes = new ArrayList<>();
 
@@ -366,7 +366,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
         sessionStart = 0;   // restarts when the next boss spawns
     }
 
-    private static final int GRAD_BEST = 0xFF00AA00, GRAD_MID = 0xFFFFAA00, GRAD_WORST = 0xFFAA0000;   // dark green -> gold -> dark red
+    private static final int GRAD_BEST = 0xFF00AA00, GRAD_MID = 0xFFFF9900, GRAD_WORST = 0xFFAA0000;   // green -> orange -> red
 
     /** HUD text (everything except the attunement line) is drawn at this multiple of its original size (1.20 = 20% bigger). */
     private static final float TEXT_SIZE = 1.20f;
@@ -378,23 +378,28 @@ public class BlazeSlayerMod implements ClientModInitializer {
         return 0xFF000000 | (r << 16) | (g << 8) | bl;
     }
 
-    /** How far from the average a time has to be for the full green / full red (0.5 = 50% faster / slower). */
-    private static final double GRAD_RANGE = 0.5;
+    /** Within this fraction of the average a time counts as "same-ish" and is plain orange (0.03 = within 3%). */
+    private static final double SAME_BAND = 0.03;
+    /** How far from the average a time has to be for the full green / full red (0.10 = 10% faster / slower). */
+    private static final double GRAD_RANGE = 0.10;
 
     /**
-     * Colours a time by how it compares to the session average of the earlier kills: gold at the average,
-     * shading to dark green as it gets faster and to dark red as it gets slower, full colour at GRAD_RANGE
-     * away from the average. With no earlier data (tracker off, or the first kill) the fallback is used.
+     * Colours a time by how it compares to the current average of the earlier kills / spawns (the same
+     * average the session table shows): orange when it is within SAME_BAND of the average, shading to green as
+     * it gets faster and to red as it gets slower, full colour at GRAD_RANGE away from the average.
+     * With no earlier data (tracker off, or the first one) there is nothing to compare to, so it is orange.
      */
-    private static int rankColor(long v, List<Long> previous, int fallback) {
-        if (previous.isEmpty()) return fallback;
+    private static int rankColor(long v, List<Long> previous) {
+        if (previous.isEmpty()) return GRAD_MID;
         double avg = 0;
         for (long x : previous) avg += x;
         avg /= previous.size();
-        if (avg <= 0) return fallback;
+        if (avg <= 0) return GRAD_MID;
         double dev = (v - avg) / avg;                                         // -0.2 = 20% faster than average
-        double t = Math.max(0, Math.min(1, 0.5 + dev / (2 * GRAD_RANGE)));    // 0 = green, 0.5 = average, 1 = red
-        return t < 0.5 ? lerpColor(GRAD_BEST, GRAD_MID, t * 2) : lerpColor(GRAD_MID, GRAD_WORST, (t - 0.5) * 2);
+        double mag = Math.abs(dev);
+        if (mag <= SAME_BAND) return GRAD_MID;                                // same-ish as the average
+        double t = Math.min(1, (mag - SAME_BAND) / (GRAD_RANGE - SAME_BAND)); // 0 = just outside the band, 1 = full colour
+        return lerpColor(GRAD_MID, dev < 0 ? GRAD_BEST : GRAD_WORST, t);      // faster = green, slower = red
     }
 
     // Flame-coloured chat title: "Blaze" fades from yellow-orange to red-orange between ember-red brackets
@@ -517,7 +522,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
     /** Short loot-table names, matched on the normalised item name (first match wins). */
     // Display names: one or two whole words, nothing abbreviated mid-word.
     private static final String[][] SHORT_NAMES = {
-            {"highclassarchfiend", "HC Dice"},
+            {"highclassarchfiend", "High Class Dice"},
             {"archfienddice", "Archfiend Dice"},
             {"subzeroinverter", "Subzero Inverter"},
             {"kelvininverter", "Kelvin Inverter"},
@@ -1123,8 +1128,8 @@ public class BlazeSlayerMod implements ClientModInitializer {
         }
         resultKillMs = dur > 0 ? dur : -1;
         // Colours compare this kill against the average of the kills before it (so it isn't measured against itself)
-        resultKillColor = dur > 0 ? rankColor(dur, killTimes, 0xFF55FF55) : 0xFF55FF55;
-        resultSpawnColor = spawnMs >= 0 ? rankColor(spawnMs, spawnTimes, 0xFFFFAA00) : 0xFFFFAA00;
+        resultKillColor = dur > 0 ? rankColor(dur, killTimes) : GRAD_MID;
+        resultSpawnColor = spawnMs >= 0 ? rankColor(spawnMs, spawnTimes) : GRAD_MID;
         if (trackerActive && dur > 0) {
             totalKillMs += dur;
             timedKills++;
