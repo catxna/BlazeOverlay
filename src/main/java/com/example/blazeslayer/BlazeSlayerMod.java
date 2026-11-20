@@ -1,5 +1,12 @@
 package com.example.blazeslayer;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.LongArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
@@ -7,10 +14,12 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -19,6 +28,11 @@ import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.Entity;
 
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,9 +52,13 @@ import java.util.regex.Pattern;
  *  - Profit tracker (T4 Blaze): drops valued at Bazaar insta-sell (Bazaar items) or lowest BIN
  *    (everything else), minus the quest cost per boss and the gummies you eat (Bazaar instant-buy). See PriceService.
  *
+ * Saving:  the session (drops, kills, costs, gummies, timers) is saved to config/blazeslayerhelper-session.json
+ *         and restored on launch, so tracking carries on across relaunches. /blaze reset wipes it.
+ *
  * Profit: /blaze profit   (full breakdown in chat)
  *         /blaze cost N   (quest cost, default 150,000 = T4)
  *         /blaze tax      (toggle Bazaar/AH taxes in the profit maths)
+ *         /blaze mf [N|auto]  (your Magic Find; scales the guaranteed Derelict Ashes credit, see below)
  *         /blaze price X  (how an item name is priced; handy when a drop shows "?")
  *         /blaze refresh  (re-download prices now; they also refresh every 5 minutes)
  * Debug: /blaze debug  (echo slayer/drop chat lines + state changes)
@@ -96,8 +114,13 @@ public class BlazeSlayerMod implements ClientModInitializer {
     private static final long T4_QUEST_COST = 150_000;    // Inferno Demonlord Tier IV
     private static final String BOSS_KEY = "DEMONLORD";
     private static final String DERELICT_ITEM = "Derelict Ashes";   // guaranteed boss drop, never shown in chat
-    // Tier IV drops 110-155 Derelict Ashes per kill (Hypixel wiki); the real average is 132.5, rounded to 135 on purpose
-    private static final double DERELICT_AVG = 135;
+    // Tier IV now drops 64-96 Derelict Ashes per kill (before Magic Find), so the average is 80
+    private static final double DERELICT_AVG = 80;
+    // Magic Find rework (SkyBlock 0.27.3): MF is now a Fortune-style stat that also applies to guaranteed (100%) drops,
+    // so each guaranteed drop yields (1 + MF/100)x on average (150 MF = 2x guaranteed, 50% chance of a third). Cap is 500.
+    private static final double MF_CAP = 500;
+    // Drop messages end in "(+123% star Magic Find)"; the number is read as the player's own Magic Find
+    private static final Pattern MF_VALUE = Pattern.compile("\\(\\+\\s*([\\d,]*\\.?\\d+)\\s*%?[^)]*?magic\\s*find[^)]*\\)\\s*$", Pattern.CASE_INSENSITIVE);
 
     private boolean dropsHudEnabled = true;
     private boolean hideSwapDisplay = true;   // hide Hypixel's own on-screen attunement text
@@ -136,7 +159,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
     private final List<Long> spawnTimes = new ArrayList<>();
 
     // Session stats
-    private boolean trackerActive = false;   // the session tracker only runs after /blaze tracker
+    private boolean trackerActive = true;    // always tracking by default; /blaze tracker stops it (that choice is saved too)
     private long sessionStart = 0;  // 0 = not started yet (starts when the first boss spawns)
     private int bossesKilled = 0;
     private long totalKillMs = 0;   // sum of fight durations
@@ -154,6 +177,8 @@ public class BlazeSlayerMod implements ClientModInitializer {
     private final Map<String, Double> dropQty = new LinkedHashMap<>();    // item -> total units (drops counts events, this counts items)
     private final Map<String, Double> itemValue = new LinkedHashMap<>(); // item -> net coins for all units (NaN = no price)
     private long questCost = T4_QUEST_COST;
+    private double magicFind = 0;             // player's Magic Find (0-500); scales guaranteed drops
+    private boolean magicFindPinned = false;  // true once set with /blaze mf N: chat readings no longer overwrite it
     private int questsCharged = 0;      // bosses killed + quests failed: each one cost questCost
     private int questsFailed = 0;
     private double revenue = 0;         // net value of every priced drop
@@ -167,7 +192,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
             "Flawed Opal Gemstone", "Scorched Power Crystal", "Gabagool Distillate", "Nether Wart Distillate",
             "Magma Cream Distillate", "Glowstone Distillate", "Blaze Rod Distillate", "Mana Disintegrator",
             "Bundle of Magma Arrows", "Enchanted Blaze Powder", "Wisp's Ice-Flavored Water I Splash Potion",
-            "Enchanted Book (Duplex I)", "Enchanted Book (Fire Aspect III)", "Enchanted Book (Smoldering I)",
+            "Enchanted Book (Duplex I)", "Enchanted Book (Fire Aspect III)", "Enchanted Book (Smoldering VI)",
             "Inferno Demonlord Shard", "Paragon Shard", "Derelict Ashes", "Netherrack-Looking Sunshade",
             "Re-heated Gummy Polar Bear"
     };
@@ -210,6 +235,8 @@ public class BlazeSlayerMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         instance = this;
+        loadState();
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> saveState());
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level == null || client.player == null) return;
             if (hideSwapDisplay) hideSwapTitle(client);
@@ -217,6 +244,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
             tick++;
             prices.refreshIfDue();                        // no-op unless a refresh is due; the download runs off-thread
             if (tick % 20 == 0) recomputeProfit();        // once a second: picks up fresh prices
+            if (tick % 600 == 0) saveState();             // every 30s, so a crash loses almost nothing
 
             if (inFight || questStart > 0 || tick % 4 == 0) scan(client);   // every tick in a fight (hit pacing) and while waiting for the boss (exact spawn time), else every 4th
         });
@@ -240,6 +268,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             resetFight();
             questStart = 0;
+            saveState();
         });
 
         // Registered first = runs before the vanilla title is drawn, every frame
@@ -253,7 +282,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
                 dispatcher.register(ClientCommands.literal("blaze")
-                        .executes(ctx -> reply(ctx, "Blaze Slayer Helper loaded. /blaze tracker | drops | reset | ids | profit | cost | tax | price | refresh | debug | scan | swap | gummy"))
+                        .executes(ctx -> reply(ctx, "Blaze Slayer Helper loaded. /blaze tracker | drops | reset | ids | profit | cost | mf | tax | price | refresh | debug | scan | swap | gummy"))
                         .then(ClientCommands.literal("drops").executes(ctx -> {
                             dropsHudEnabled = !dropsHudEnabled;
                             return reply(ctx, "Drop list " + (dropsHudEnabled ? "on" : "off"));
@@ -266,18 +295,21 @@ public class BlazeSlayerMod implements ClientModInitializer {
                         }))
                         .then(ClientCommands.literal("reset").executes(ctx -> {
                             resetSession();
-                            return reply(ctx, "Session reset");
+                            saveState();
+                            return reply(ctx, "Session reset (the saved session was cleared too)");
                         }))
                         .then(ClientCommands.literal("tracker").executes(ctx -> {
                             if (trackerActive) {
                                 trackerActive = false;
-                                return reply(ctx, "Tracker stopped. Nothing more is recorded; /blaze profit still shows this session until you start again.");
+                                saveState();
+                                return reply(ctx, "Tracker stopped. Nothing more is recorded and it stays off after a relaunch; /blaze profit still shows this session until you start again.");
                             }
                             resetSession();                       // launching = a fresh session
                             trackerActive = true;
                             dropsHudEnabled = true;
                             if (inFight) sessionStart = fightStart;   // launched mid-fight: the clock starts with that boss
-                            return reply(ctx, "Tracker started (fresh session). /blaze tracker again to stop.");
+                            saveState();
+                            return reply(ctx, "Tracker started (fresh session). It now resumes automatically after relaunches; /blaze tracker again to stop.");
                         }))
                         .then(ClientCommands.literal("debug").executes(ctx -> {
                             debug = !debug;
@@ -310,11 +342,29 @@ public class BlazeSlayerMod implements ClientModInitializer {
                             recomputeProfit();
                             return reply(ctx, "Taxes in profit maths: " + (prices.taxes ? "on" : "off (gross prices)"));
                         }))
+                        .then(ClientCommands.literal("mf")
+                                .executes(ctx -> reply(ctx, "Magic Find: " + fmtMf(magicFind)
+                                        + (magicFindPinned ? " (set by you; /blaze mf auto to read it from drop messages)"
+                                        : magicFind > 0 ? " (read from drop messages)" : " (not seen yet: Derelict Ashes use the base amount)")
+                                        + " | guaranteed drops x" + fmtMf(1 + magicFind / 100)))
+                                .then(ClientCommands.literal("auto").executes(ctx -> {
+                                    magicFindPinned = false;
+                                    saveState();
+                                    return reply(ctx, "Magic Find will be read from drop messages again (currently " + fmtMf(magicFind) + ")");
+                                }))
+                                .then(ClientCommands.argument("value", DoubleArgumentType.doubleArg(0, MF_CAP)).executes(ctx -> {
+                                    magicFind = DoubleArgumentType.getDouble(ctx, "value");
+                                    magicFindPinned = true;
+                                    saveState();
+                                    return reply(ctx, "Magic Find set to " + fmtMf(magicFind)
+                                            + ": Derelict Ashes now credited x" + fmtMf(1 + magicFind / 100) + " per kill");
+                                })))
                         .then(ClientCommands.literal("cost")
                                 .executes(ctx -> reply(ctx, "Quest cost: " + fmtCoins(questCost)))
                                 .then(ClientCommands.argument("coins", LongArgumentType.longArg(0)).executes(ctx -> {
                                     questCost = LongArgumentType.getLong(ctx, "coins");
                                     recomputeProfit();
+                                    saveState();
                                     return reply(ctx, "Quest cost set to " + fmtCoins(questCost));
                                 })))
                         .then(ClientCommands.literal("ids").executes(ctx -> {
@@ -342,6 +392,118 @@ public class BlazeSlayerMod implements ClientModInitializer {
     }
 
     // ------------------------------------------------------------ helpers
+
+    // ------------------------------------------------------------ saving
+
+    private static final String SAVE_FILE = "blazeslayerhelper-session.json";
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    private static Path savePath() {
+        return FabricLoader.getInstance().getConfigDir().resolve(SAVE_FILE);
+    }
+
+    /** Writes the whole session to disk (small file; called every 30s, on each kill and when the game closes). */
+    private void saveState() {
+        try {
+            long now = System.currentTimeMillis();
+            JsonObject o = new JsonObject();
+            o.addProperty("version", 1);
+            o.addProperty("trackerActive", trackerActive);
+            o.addProperty("dropsHudEnabled", dropsHudEnabled);
+            o.addProperty("elapsedMs", sessionStart > 0 ? Math.max(0, now - sessionStart) : 0);   // time the game was closed is not counted
+            o.addProperty("bossesKilled", bossesKilled);
+            o.addProperty("totalKillMs", totalKillMs);
+            o.addProperty("timedKills", timedKills);
+            o.addProperty("totalSpawnMs", totalSpawnMs);
+            o.addProperty("spawnTimed", spawnTimed);
+            o.addProperty("totalQuestMs", totalQuestMs);
+            o.addProperty("questTimed", questTimed);
+            o.addProperty("questsCharged", questsCharged);
+            o.addProperty("questsFailed", questsFailed);
+            o.addProperty("gummiesEaten", gummiesEaten);
+            o.addProperty("gummyUntil", gummyUntil);
+            o.addProperty("questCost", questCost);
+            o.addProperty("magicFind", magicFind);
+            o.addProperty("magicFindPinned", magicFindPinned);
+
+            JsonObject d = new JsonObject();
+            for (Map.Entry<String, Integer> e : drops.entrySet()) {
+                JsonObject one = new JsonObject();
+                one.addProperty("count", e.getValue());
+                Rarity r = dropRarity.get(e.getKey());
+                one.addProperty("rarity", (r == null ? Rarity.UNCOMMON : r).name());
+                one.addProperty("qty", dropQty.getOrDefault(e.getKey(), (double) e.getValue()));
+                d.add(e.getKey(), one);
+            }
+            o.add("drops", d);
+            JsonArray kt = new JsonArray();
+            for (Long v : killTimes) kt.add(v);
+            o.add("killTimes", kt);
+            JsonArray st = new JsonArray();
+            for (Long v : spawnTimes) st.add(v);
+            o.add("spawnTimes", st);
+
+            Path file = savePath();
+            Path tmp = file.resolveSibling(SAVE_FILE + ".tmp");
+            Files.createDirectories(file.getParent());
+            Files.writeString(tmp, GSON.toJson(o));
+            Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);   // never leaves a half-written save behind
+        } catch (IOException | RuntimeException e) {
+            dbg("could not save session: " + e);
+        }
+    }
+
+    /** Restores the saved session on launch. No file (first run) or a damaged file just starts fresh. */
+    private void loadState() {
+        Path file = savePath();
+        if (!Files.exists(file)) return;
+        try (Reader rd = Files.newBufferedReader(file)) {
+            JsonObject o = JsonParser.parseReader(rd).getAsJsonObject();
+            long now = System.currentTimeMillis();
+            trackerActive = o.has("trackerActive") ? o.get("trackerActive").getAsBoolean() : true;
+            dropsHudEnabled = o.has("dropsHudEnabled") ? o.get("dropsHudEnabled").getAsBoolean() : true;
+            long elapsed = o.has("elapsedMs") ? o.get("elapsedMs").getAsLong() : 0;
+            sessionStart = elapsed > 0 ? now - elapsed : 0;   // clock carries on from where it stopped
+            bossesKilled = o.has("bossesKilled") ? o.get("bossesKilled").getAsInt() : 0;
+            totalKillMs = o.has("totalKillMs") ? o.get("totalKillMs").getAsLong() : 0;
+            timedKills = o.has("timedKills") ? o.get("timedKills").getAsInt() : 0;
+            totalSpawnMs = o.has("totalSpawnMs") ? o.get("totalSpawnMs").getAsLong() : 0;
+            spawnTimed = o.has("spawnTimed") ? o.get("spawnTimed").getAsInt() : 0;
+            totalQuestMs = o.has("totalQuestMs") ? o.get("totalQuestMs").getAsLong() : 0;
+            questTimed = o.has("questTimed") ? o.get("questTimed").getAsInt() : 0;
+            questsCharged = o.has("questsCharged") ? o.get("questsCharged").getAsInt() : 0;
+            questsFailed = o.has("questsFailed") ? o.get("questsFailed").getAsInt() : 0;
+            gummiesEaten = o.has("gummiesEaten") ? o.get("gummiesEaten").getAsInt() : 0;
+            long gu = o.has("gummyUntil") ? o.get("gummyUntil").getAsLong() : 0;
+            gummyUntil = gu > now ? gu : 0;                    // the buff runs in real time, so only an unexpired one comes back
+            if (o.has("questCost")) questCost = o.get("questCost").getAsLong();
+            if (o.has("magicFind")) magicFind = Math.max(0, Math.min(MF_CAP, o.get("magicFind").getAsDouble()));
+            magicFindPinned = o.has("magicFindPinned") && o.get("magicFindPinned").getAsBoolean();
+
+            drops.clear();
+            dropRarity.clear();
+            dropQty.clear();
+            if (o.has("drops")) {
+                for (Map.Entry<String, JsonElement> e : o.getAsJsonObject("drops").entrySet()) {
+                    JsonObject one = e.getValue().getAsJsonObject();
+                    int count = one.has("count") ? one.get("count").getAsInt() : 1;
+                    drops.put(e.getKey(), count);
+                    Rarity r = Rarity.UNCOMMON;
+                    try { if (one.has("rarity")) r = Rarity.valueOf(one.get("rarity").getAsString()); }
+                    catch (IllegalArgumentException ignored) { /* unknown rarity name: keep the default */ }
+                    dropRarity.put(e.getKey(), r);
+                    dropQty.put(e.getKey(), one.has("qty") ? one.get("qty").getAsDouble() : count);
+                }
+            }
+            killTimes.clear();
+            if (o.has("killTimes")) for (JsonElement v : o.getAsJsonArray("killTimes")) killTimes.add(v.getAsLong());
+            spawnTimes.clear();
+            if (o.has("spawnTimes")) for (JsonElement v : o.getAsJsonArray("spawnTimes")) spawnTimes.add(v.getAsLong());
+            recomputeProfit();   // prices load a moment later; the once-a-second refresh fills in the values
+        } catch (IOException | RuntimeException e) {
+            dbg("could not load saved session, starting fresh: " + e);
+        }
+    }
 
     private void resetSession() {
         drops.clear();
@@ -457,12 +619,13 @@ public class BlazeSlayerMod implements ClientModInitializer {
     }
 
     /**
-     * Drops that can happen at any time rather than only at the boss's death: the Smoldering I book
-     * (regular tomb blazes) and the Nether Star (inside and outside the boss fight).
+     * Drops that are counted whenever they appear rather than only around the boss's death: the Smoldering
+     * books (Smoldering VI from the boss, older levels from tomb blazes; "Smolder" is matched too) and the
+     * Nether Star (inside and outside the boss fight).
      */
     private static boolean isNonBossDrop(String item) {
         String n = norm(item);
-        return n.contains("smoldering") || n.contains("netherstar");
+        return n.contains("smolder") || n.contains("netherstar");
     }
 
     private static boolean isFieryRune(String n) { return n.contains("fiery") && n.contains("rune"); }
@@ -540,6 +703,8 @@ public class BlazeSlayerMod implements ClientModInitializer {
             {"blazeroddistillate", "Rod Distillate"},
             {"manadisintegrator", "Disintegrator"},
             {"derelictashe", "Derelict Ashe"},
+            {"smolderingvi", "Smolder VI"},
+            {"smoldervi", "Smolder VI"},
             {"smoldering", "Smoldering Book"},
             {"paragonshard", "Paragon Shard"},
             {"infernodemonlordshard", "Demonlord Shard"},
@@ -576,6 +741,28 @@ public class BlazeSlayerMod implements ClientModInitializer {
         dropRarity.merge(item, r, (a, b) -> a.ordinal() >= b.ordinal() ? a : b);
         dropQty.merge(item, Math.max(1.0, qty), Double::sum);
         recomputeProfit();
+    }
+
+    /** Picks the player's own Magic Find out of the "(+123% Magic Find)" tail of a drop message, unless /blaze mf pinned it. */
+    private void readMagicFind(String dropText) {
+        if (magicFindPinned) return;
+        Matcher mf = MF_VALUE.matcher(dropText.trim());
+        if (!mf.find()) return;
+        try {
+            double v = Double.parseDouble(mf.group(1).replace(",", ""));
+            if (v < 0 || v > MF_CAP) {   // outside the possible range: this is not the Magic Find stat, ignore it
+                dbg("ignored Magic Find reading " + v + " (outside 0-" + (int) MF_CAP + ")");
+                return;
+            }
+            if (v != magicFind) dbg("Magic Find read from chat: " + fmtMf(v));
+            magicFind = v;
+        } catch (NumberFormatException ignored) {
+            // unparsable number: keep the previous value
+        }
+    }
+
+    private static String fmtMf(double v) {
+        return v == Math.rint(v) ? String.valueOf((long) v) : String.format(Locale.ROOT, "%.1f", v);
     }
 
     /** Stack size from "5x Item", "Item (5x)", "Item (x5)" or "Item x5"; 1 if there is none. */
@@ -1082,6 +1269,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
                 questsCharged++;      // the fee is gone whether or not the boss died
                 questsFailed++;
             }
+            saveState();
             resetFight();
             questStart = 0;
             ignoreBossUntil = now + POST_KILL_IGNORE_MS;
@@ -1097,6 +1285,7 @@ public class BlazeSlayerMod implements ClientModInitializer {
         Matcher m = DROP.matcher(text);
         if (m.matches()) {
             Rarity rarity = Rarity.parse(m.group(1));
+            readMagicFind(m.group(2));
             String item = MF_SUFFIX.matcher(m.group(2).trim()).replaceFirst("").trim();
             if (item.startsWith("(") && item.endsWith(")")) {
                 item = item.substring(1, item.length() - 1).trim();
@@ -1153,12 +1342,15 @@ public class BlazeSlayerMod implements ClientModInitializer {
 
         // Derelict Ashes always drop from the boss but Hypixel never prints them in chat, and the amount is a
         // range, so every confirmed kill (not a failed quest) credits the average of that range, priced from the Bazaar.
-        addDrop(DERELICT_ITEM, Rarity.UNCOMMON, DERELICT_AVG);
-        dbg("derelict ashes credited x" + DERELICT_AVG + " (average of the 110-155 range, rounded)");
+        // Magic Find is a Fortune-style stat since 0.27.3: guaranteed drops average (1 + MF/100)x.
+        double derelict = DERELICT_AVG * (1 + magicFind / 100.0);
+        addDrop(DERELICT_ITEM, Rarity.UNCOMMON, derelict);
+        dbg("derelict ashes credited x" + fmtMf(derelict) + " (avg " + fmtMf(DERELICT_AVG) + " x MF " + fmtMf(magicFind) + ")");
 
         resetFight();
         questStart = 0;
         ignoreBossUntil = Math.max(ignoreBossUntil, now + POST_KILL_IGNORE_MS);
+        saveState();
     }
 
     // ------------------------------------------------------------ HUD
@@ -1289,45 +1481,62 @@ public class BlazeSlayerMod implements ClientModInitializer {
             }
             y += 4;
 
-            if (drops.isEmpty()) {
+            // Itemized breakdown: drops (most profitable first) followed by the cost rows, which are
+            // always the bottom lines and always shown (even with no drops, even when drops overflow).
+            // Gummies only appears after one has been eaten; Spawn cost is always shown.
+            // Ordered by what each item has earned this session (net of tax); unpriced items sink to the
+            // bottom of the drops; ties keep first-drop order (List.sort is stable).
+            List<Map.Entry<String, Integer>> sorted = new ArrayList<>(drops.entrySet());
+            sorted.sort((d1, d2) -> Double.compare(sortValue(d2.getKey()), sortValue(d1.getKey())));
+            int shown = Math.min(sorted.size(), MAX_DROP_LINES);
+
+            if (sorted.isEmpty()) {
                 g.text(mc.font, "No drops yet", x, y, 0xFFAAAAAA, true);
-            } else {
-                // Most profitable first: ordered by what each item has earned this session (net of tax).
-                // Unpriced items sink to the bottom; ties keep first-drop order (List.sort is stable).
-                List<Map.Entry<String, Integer>> sorted = new ArrayList<>(drops.entrySet());
-                sorted.sort((d1, d2) -> Double.compare(sortValue(d2.getKey()), sortValue(d1.getKey())));
-                int shown = Math.min(sorted.size(), MAX_DROP_LINES);
+                y += line;
+            }
 
-                // Two columns: names on the left, counts right-aligned in their own column
-                int nameW = 0, countW = 0;
-                for (int i = 0; i < shown; i++) {
-                    nameW = Math.max(nameW, mc.font.width(shortName(sorted.get(i).getKey())));
-                    countW = Math.max(countW, mc.font.width(countLabel(sorted.get(i).getKey())));
-                }
-                int countRight = x + nameW + 8 + countW;
+            // rows: {name, count, value, nameColor, valueColor}
+            List<Object[]> items = new ArrayList<>();
+            for (int i = 0; i < shown; i++) {
+                String item = sorted.get(i).getKey();
+                Double v = itemValue.get(item);
+                boolean unknown = v == null || Double.isNaN(v);
+                items.add(new Object[]{shortName(item), countLabel(item), unknown ? "?" : fmtCoins(v),
+                        dropColor(item), unknown ? 0xFF777777 : 0xFFFFAA00});
+            }
+            int extra = sorted.size() - shown;
 
-                // Third column: what the item is worth in total (net of tax); "?" = no price found
-                String[] values = new String[shown];
-                int valW = 0;
-                for (int i = 0; i < shown; i++) {
-                    Double v = itemValue.get(sorted.get(i).getKey());
-                    values[i] = v == null || Double.isNaN(v) ? "?" : fmtCoins(v);
-                    valW = Math.max(valW, mc.font.width(values[i]));
-                }
-                int valRight = countRight + 8 + valW;
-                for (int i = 0; i < shown; i++) {
-                    String item = sorted.get(i).getKey();
-                    String count = countLabel(item);
-                    int color = dropColor(item);
-                    g.text(mc.font, shortName(item), x, y, color, true);
-                    g.text(mc.font, count, countRight - mc.font.width(count), y, color, true);
-                    g.text(mc.font, values[i], valRight - mc.font.width(values[i]), y,
-                            values[i].equals("?") ? 0xFF777777 : 0xFFFFAA00, true);
+            // Costs are shown as negatives. Gummy price unknown (and some eaten) -> "?"
+            String gummyVal = gummiesEaten > 0 && Double.isNaN(gummyUnit) ? "?" : fmtCoins(-gummyCost());
+            Object[] gummyRow = {"Gummies", "x" + gummiesEaten, gummyVal, 0xFFFF7777,
+                    gummyVal.equals("?") ? 0xFF777777 : 0xFFFF5555};
+            Object[] spawnRow = {"Spawn cost", "x" + questsCharged, fmtCoins(-totalCost()), 0xFFFF7777, 0xFFFF5555};
+
+            List<Object[]> all = new ArrayList<>(items);
+            all.add(spawnRow);
+            if (gummiesEaten > 0) all.add(gummyRow);   // only once a gummy has actually been eaten (always the last row)
+
+            // Three columns: names on the left, counts right-aligned in their own column, then total value
+            int nameW = 0, countW = 0, valW = 0;
+            for (Object[] r : all) {
+                nameW = Math.max(nameW, mc.font.width((String) r[0]));
+                countW = Math.max(countW, mc.font.width((String) r[1]));
+                valW = Math.max(valW, mc.font.width((String) r[2]));
+            }
+            int countRight = x + nameW + 8 + countW;
+            int valRight = countRight + 8 + valW;
+
+            for (int i = 0; i < all.size(); i++) {
+                Object[] r = all.get(i);
+                if (i == items.size() && extra > 0) {   // overflow note sits between the drops and the cost rows
+                    g.text(mc.font, "+" + extra + " more", x, y, 0xFFAAAAAA, true);
                     y += line;
                 }
-                if (sorted.size() > shown) {
-                    g.text(mc.font, "+" + (sorted.size() - shown) + " more", x, y, 0xFFAAAAAA, true);
-                }
+                String count = (String) r[1], val = (String) r[2];
+                g.text(mc.font, (String) r[0], x, y, (Integer) r[3], true);
+                g.text(mc.font, count, countRight - mc.font.width(count), y, (Integer) r[3], true);
+                g.text(mc.font, val, valRight - mc.font.width(val), y, (Integer) r[4], true);
+                y += line;
             }
             tablePose.popMatrix();
         }

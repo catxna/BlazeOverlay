@@ -335,7 +335,8 @@ final class PriceService {
             // Enchanted books are not in Hypixel's items resource, so their ids can't be guessed from the name
             {"duplex", "ENCHANTMENT_ULTIMATE_REITERATE_1"},      // Duplex's internal name is Reiterate
             {"fireaspectiii", "ENCHANTMENT_FIRE_ASPECT_3"},
-            {"smolderingi", "ENCHANTMENT_SMOLDERING_1"},
+            {"smolderingvi", "ENCHANTMENT_SMOLDERING_6"},   // Smoldering VI is on the Bazaar since the Magic Find rework
+            {"smoldervi", "ENCHANTMENT_SMOLDERING_6"},       // same book if Hypixel shortens the name
             {"fieryburstrune", "FIERY_BURST_RUNE;1"},
             {"lavatearsrune", "LAVATEARS_RUNE;1"},
             // Bazaar (insta-sell)
